@@ -1,0 +1,7 @@
+{
+    "best_model": "XGBoost",
+    "r2": 0.8840346932411194,
+    "training_rows": 3148,
+    "testing_rows": 788,
+    "feature_count": 30
+}
