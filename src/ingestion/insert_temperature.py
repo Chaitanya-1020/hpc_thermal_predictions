@@ -1,114 +1,104 @@
-print("SCRIPT STARTED")
-import os
-import sys
-import json
-import traceback
+"""
+Insert temperature telemetry into MySQL.
 
-PROJECT_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..")
-)
+This script:
 
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+1. Scans all temperature.json files
+2. Reads JSON records
+3. Extracts every socket and every core
+4. Inserts data into MySQL
+"""
 
-from database.mysql_connection import get_connection
+from pathlib import Path
 
-JSON_FILE = r"data/raw/temp.json"
+from src.ingestion.file_scanner import find_json_files
+from src.ingestion.json_parser import iter_json_records
+from src.ingestion.db_writer import batch_insert
+from src.ingestion.config import RAW_DATA_DIR
+
 
 INSERT_QUERY = """
-INSERT INTO temperature
-(timestamp,node,socket,core,temperature)
+INSERT IGNORE INTO temperature
+(
+    timestamp,
+    node,
+    socket,
+    core,
+    temperature
+)
 VALUES (%s,%s,%s,%s,%s)
-ON DUPLICATE KEY UPDATE
-temperature=VALUES(temperature)
 """
 
 
-def insert_temperature():
-
-    print("========== START ==========")
-
-    conn = get_connection()
-    cursor = conn.cursor()
-
+def extract_temperature_records(record):
     rows = []
 
-    try:
+    timestamp = record["timestamp"]
 
-        with open(JSON_FILE, "r", encoding="utf-8") as file:
+    node = next(iter(record["data"]))
 
-            buffer = ""
-            braces = 0
+    node_data = record["data"][node]
 
-            for line in file:
+    for socket_name, socket_data in node_data.items():
 
-                buffer += line
+        # Skip metadata keys like "timestamp"
+        if not socket_name.startswith("socket_"):
+            continue
 
-                braces += line.count("{")
-                braces -= line.count("}")
+        socket_id = int(socket_name.replace("socket_", ""))
 
-                if braces == 0 and buffer.strip():
+        cpu = socket_data.get("CPU", {})
 
-                    obj = json.loads(buffer)
+        core_data = cpu.get("Core", {})
 
-                    buffer = ""
+        for key, value in core_data.items():
 
-                    timestamp = obj["timestamp"]
+            if not key.startswith("temp_celsius_core_"):
+                continue
 
-                    for node, node_data in obj["data"].items():
+            core_id = int(key.replace("temp_celsius_core_", ""))
 
-                        for socket_name, socket_data in node_data.items():
+            rows.append(
+                (
+                    timestamp,
+                    node,
+                    socket_id,
+                    core_id,
+                    float(value),
+                )
+            )
 
-                            if not socket_name.startswith("socket_"):
-                                continue
-
-                            socket = int(socket_name.split("_")[1])
-
-                            cores = socket_data["CPU"]["Core"]
-
-                            for core_name, temp in cores.items():
-
-                                core = int(
-                                    core_name.replace(
-                                        "temp_celsius_core_",
-                                        ""
-                                    )
-                                )
-
-                                rows.append(
-                                    (
-                                        timestamp,
-                                        node,
-                                        socket,
-                                        core,
-                                        float(temp),
-                                    )
-                                )
-
-        print(f"Prepared {len(rows)} rows")
-
-        cursor.executemany(INSERT_QUERY, rows)
-
-        conn.commit()
-
-        print(f"Inserted {cursor.rowcount} rows successfully.")
-
-    except Exception:
-
-        conn.rollback()
-
-        traceback.print_exc()
-
-    finally:
-
-        cursor.close()
-        conn.close()
-
-        print("========== END ==========")
+    return rows
 
 
-print("__name__ =", __name__)
+def main():
+
+    all_rows = []
+
+    json_files = find_json_files(
+        RAW_DATA_DIR,
+        "temp.json"
+    )
+
+    print(f"\nFound {len(json_files)} temperature files.\n")
+
+    for file in json_files:
+
+        print(f"Reading: {file}")
+
+        for record in iter_json_records(file):
+
+            all_rows.extend(
+                extract_temperature_records(record)
+            )
+
+    print(f"\nTotal rows extracted: {len(all_rows)}")
+
+    batch_insert(
+        INSERT_QUERY,
+        all_rows
+    )
+
 
 if __name__ == "__main__":
-    print("Calling insert_temperature()")
-    insert_temperature()
+    main()

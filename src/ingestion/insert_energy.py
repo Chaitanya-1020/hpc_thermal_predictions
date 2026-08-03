@@ -1,46 +1,43 @@
-import os
-import sys
-import json
-
-# ------------------------------------------------------------------
-# Add project root
-# ------------------------------------------------------------------
-PROJECT_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..")
-)
-
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
-from database.mysql_connection import get_connection
-
-# ------------------------------------------------------------------
-# JSON File
-# ------------------------------------------------------------------
-JSON_FILE = "data/raw/energy.json"
-
-# ------------------------------------------------------------------
-# SQL Query
-# ------------------------------------------------------------------
-INSERT_QUERY = """
-INSERT INTO energy
-(timestamp, node, socket, cpu_energy, memory_energy, node_energy)
-VALUES (%s, %s, %s, %s, %s, %s)
-ON DUPLICATE KEY UPDATE
-cpu_energy = VALUES(cpu_energy),
-memory_energy = VALUES(memory_energy),
-node_energy = VALUES(node_energy)
+"""
+Insert Energy telemetry into MySQL.
 """
 
-# ------------------------------------------------------------------
-# Read concatenated JSON objects
-# ------------------------------------------------------------------
-def read_json_objects(file_path):
+from src.ingestion.file_scanner import find_json_files
+from src.ingestion.json_parser import iter_json_records
+from src.ingestion.db_writer import batch_insert
+from src.ingestion.config import RAW_DATA_DIR
+
+
+INSERT_QUERY = """
+INSERT IGNORE INTO energy
+(
+    timestamp,
+    node,
+    socket,
+    cpu_energy,
+    memory_energy
+)
+VALUES (%s,%s,%s,%s,%s)
+"""
+import json
+from json import JSONDecodeError
+
+
+def read_energy_objects(file_path):
+    """
+    Reads concatenated JSON objects from energy.json.
+
+    If a JSON object is malformed (as in the first few records of the
+    mentor dataset), it is skipped and ingestion continues.
+
+    The original dataset is NEVER modified.
+    """
 
     with open(file_path, "r", encoding="utf-8") as file:
 
         buffer = ""
         braces = 0
+        skipped = 0
 
         for line in file:
 
@@ -49,82 +46,114 @@ def read_json_objects(file_path):
             braces += line.count("{")
             braces -= line.count("}")
 
-            if braces == 0 and buffer.strip():
+            # wait until one complete object is collected
+            if braces != 0:
+                continue
 
-                try:
-                    obj = json.loads(buffer)
+            if not buffer.strip():
+                buffer = ""
+                continue
 
-    # Skip records with empty data
-                    if not obj.get("data"):
-                        buffer = ""
-                        continue
+            try:
 
+                obj = json.loads(buffer)
+
+                # Skip records whose data field is missing/empty
+                if (
+                    "data" not in obj
+                    or obj["data"] is None
+                    or obj["data"] == {}
+                ):
+                    print(
+                        f"⚠ Skipping empty record at {obj.get('timestamp')}"
+                    )
+
+                else:
                     yield obj
 
-                except json.JSONDecodeError:
-                    print("Skipping invalid JSON record...")
-                    buffer = "" 
+            except JSONDecodeError:
 
-            
+                # Expected for the first few malformed records
+                preview = buffer.replace("\n", " ")[:80]
 
+                print(
+                    f"⚠ Skipping malformed record: {preview}..."
+                )
 
-# ------------------------------------------------------------------
-# Insert Energy Data
-# ------------------------------------------------------------------
-def insert_energy():
+                skipped += 1
 
-    print("========== START ==========")
+            finally:
 
-    conn = get_connection()
-    cursor = conn.cursor()
+                buffer = ""
+
+        if skipped:
+            print(f"\nSkipped {skipped} malformed records.\n")
+def extract_energy_records(record):
 
     rows = []
 
-    for obj in read_json_objects(JSON_FILE):
+    timestamp = record["timestamp"]
 
-        timestamp = obj["timestamp"]
+    node = next(iter(record["data"]))
 
-        data = obj["data"]
+    node_data = record["data"][node]
 
-        for node, node_data in data.items():
+    for socket_name, socket_data in node_data.items():
 
-            node_energy = float(node_data["energy_node_joules"])
+        if not socket_name.startswith("socket_"):
+            continue
 
-            for socket in [0, 1]:
+        socket = int(socket_name.replace("socket_", ""))
 
-                socket_key = f"socket_{socket}"
+        cpu_energy = float(
+            socket_data.get("energy_cpu_joules", 0)
+        )
 
-                socket_data = node_data[socket_key]
+        memory_energy = float(
+            socket_data.get("energy_mem_joules", 0)
+        )
 
-                cpu_energy = float(socket_data["energy_cpu_joules"])
-                memory_energy = float(socket_data["energy_mem_joules"])
+        rows.append(
+            (
+                timestamp,
+                node,
+                socket,
+                cpu_energy,
+                memory_energy,
+            )
+        )
 
-                rows.append(
-                    (
-                        timestamp,
-                        node,
-                        socket,
-                        cpu_energy,
-                        memory_energy,
-                        node_energy
-                    )
-                )
+    return rows
 
-    print(f"Prepared {len(rows)} rows")
 
-    cursor.executemany(INSERT_QUERY, rows)
+def main():
 
-    conn.commit()
+    all_rows = []
 
-    print(f"Inserted {cursor.rowcount} rows successfully.")
+    json_files = find_json_files(
+        RAW_DATA_DIR,
+        "energy.json"
+    )
 
-    cursor.close()
-    conn.close()
+    print(f"\nFound {len(json_files)} energy files.\n")
 
-    print("=========== END ===========")
+    for file in json_files:
 
-# ------------------------------------------------------------------
-# Main
-# ------------------------------------------------------------------
+        print(f"Reading: {file}")
+
+        for record in read_energy_objects(file):
+
+            all_rows.extend(
+                extract_energy_records(record)
+            )
+
+    print(f"\nTotal rows extracted: {len(all_rows)}")
+
+    batch_insert(
+        INSERT_QUERY,
+        all_rows
+    )
+
+
 if __name__ == "__main__":
-    insert_energy()
+    main()

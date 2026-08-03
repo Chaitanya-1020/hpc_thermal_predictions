@@ -1,22 +1,21 @@
-import os
-import sys
-import pandas as pd
+"""
+Validate telemetry tables before merging.
 
-# --------------------------------------------------------
-# Project Root
-# --------------------------------------------------------
-PROJECT_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..")
-)
-
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+Checks:
+1. Missing timestamps
+2. Missing nodes
+3. Missing sockets
+4. Missing cores
+5. Duplicate rows
+6. Invalid temperatures
+7. Invalid frequencies
+8. Invalid CPU usage
+9. Null values
+"""
 
 from database.mysql_connection import get_connection
 
-# --------------------------------------------------------
-# Tables
-# --------------------------------------------------------
+
 TABLES = [
     "temperature",
     "frequency",
@@ -25,68 +24,231 @@ TABLES = [
     "energy"
 ]
 
-# --------------------------------------------------------
-# Validate One Table
-# --------------------------------------------------------
-def validate_table(conn, table):
 
-    print("=" * 70)
-    print(f"TABLE : {table}")
+def print_header(title):
+    print("\n" + "=" * 70)
+    print(title)
     print("=" * 70)
 
-    df = pd.read_sql(f"SELECT * FROM {table}", conn)
 
-    print(f"Rows : {len(df)}")
+def run_query(cursor, title, query):
 
-    print("\nMissing Values")
-    print(df.isnull().sum())
+    print(f"\n{title}")
 
-    print("\nDuplicate Rows :", df.duplicated().sum())
+    cursor.execute(query)
 
-    if "timestamp" in df.columns:
+    rows = cursor.fetchall()
 
-        print("\nTimestamp Range")
+    if not rows:
+        print("✓ No issues found")
+        return
 
-        print(df["timestamp"].min())
+    for row in rows:
+        print(row)
 
-        print(df["timestamp"].max())
 
-    if "node" in df.columns:
+def validate_temperature(cursor):
 
-        print("\nNodes")
+    print_header("TEMPERATURE TABLE")
 
-        print(df["node"].unique())
+    run_query(
+        cursor,
+        "Null Values",
+        """
+        SELECT *
+        FROM temperature
+        WHERE timestamp IS NULL
+           OR node IS NULL
+           OR socket IS NULL
+           OR core IS NULL
+           OR temperature IS NULL;
+        """
+    )
 
-    if "socket" in df.columns:
+    run_query(
+        cursor,
+        "Duplicate Rows",
+        """
+        SELECT timestamp,node,socket,core,COUNT(*)
+        FROM temperature
+        GROUP BY timestamp,node,socket,core
+        HAVING COUNT(*)>1;
+        """
+    )
 
-        print("\nSockets")
+    run_query(
+        cursor,
+        "Invalid Temperatures",
+        """
+        SELECT *
+        FROM temperature
+        WHERE temperature < 0
+           OR temperature > 120;
+        """
+    )
 
-        print(sorted(df["socket"].unique()))
 
-    if "core" in df.columns:
+def validate_frequency(cursor):
 
-        print("\nCores")
+    print_header("FREQUENCY TABLE")
 
-        print(df["core"].min(), "-", df["core"].max())
+    run_query(
+        cursor,
+        "Null Values",
+        """
+        SELECT *
+        FROM frequency
+        WHERE timestamp IS NULL
+           OR node IS NULL
+           OR socket IS NULL
+           OR core IS NULL
+           OR frequency IS NULL;
+        """
+    )
 
-    print("\nStatistics")
+    run_query(
+        cursor,
+        "Duplicate Rows",
+        """
+        SELECT timestamp,node,socket,core,COUNT(*)
+        FROM frequency
+        GROUP BY timestamp,node,socket,core
+        HAVING COUNT(*)>1;
+        """
+    )
 
-    print(df.describe(include="all"))
+    run_query(
+        cursor,
+        "Invalid Frequency",
+        """
+        SELECT *
+        FROM frequency
+        WHERE frequency < 0;
+        """
+    )
 
-    print()
 
-# --------------------------------------------------------
-# Main
-# --------------------------------------------------------
+def validate_cpu_usage(cursor):
+
+    print_header("CPU USAGE TABLE")
+
+    run_query(
+        cursor,
+        "Null Values",
+        """
+        SELECT *
+        FROM cpu_usage
+        WHERE timestamp IS NULL
+           OR node IS NULL
+           OR socket IS NULL
+           OR core IS NULL
+           OR cpu_usage IS NULL;
+        """
+    )
+
+    run_query(
+        cursor,
+        "Duplicate Rows",
+        """
+        SELECT timestamp,node,socket,core,COUNT(*)
+        FROM cpu_usage
+        GROUP BY timestamp,node,socket,core
+        HAVING COUNT(*)>1;
+        """
+    )
+
+    run_query(
+        cursor,
+        "Invalid CPU Usage",
+        """
+        SELECT *
+        FROM cpu_usage
+        WHERE cpu_usage < 0
+           OR cpu_usage > 100;
+        """
+    )
+
+
+def validate_power(cursor):
+
+    print_header("POWER TABLE")
+
+    run_query(
+        cursor,
+        "Null Values",
+        """
+        SELECT *
+        FROM power
+        WHERE timestamp IS NULL
+           OR node IS NULL
+           OR socket IS NULL
+           OR cpu_power IS NULL
+           OR memory_power IS NULL;
+        """
+    )
+
+    run_query(
+        cursor,
+        "Duplicate Rows",
+        """
+        SELECT timestamp,node,socket,COUNT(*)
+        FROM power
+        GROUP BY timestamp,node,socket
+        HAVING COUNT(*)>1;
+        """
+    )
+
+
+def validate_energy(cursor):
+
+    print_header("ENERGY TABLE")
+
+    run_query(
+        cursor,
+        "Null Values",
+        """
+        SELECT *
+        FROM energy
+        WHERE timestamp IS NULL
+           OR node IS NULL
+           OR socket IS NULL
+           OR cpu_energy IS NULL
+           OR memory_energy IS NULL;
+        """
+    )
+
+    run_query(
+        cursor,
+        "Duplicate Rows",
+        """
+        SELECT timestamp,node,socket,COUNT(*)
+        FROM energy
+        GROUP BY timestamp,node,socket
+        HAVING COUNT(*)>1;
+        """
+    )
+
+
 def main():
 
-    conn = get_connection()
+    connection = get_connection()
 
-    for table in TABLES:
+    cursor = connection.cursor()
 
-        validate_table(conn, table)
+    validate_temperature(cursor)
+    validate_frequency(cursor)
+    validate_cpu_usage(cursor)
+    validate_power(cursor)
+    validate_energy(cursor)
 
-    conn.close()
+    cursor.close()
+    connection.close()
+
+    print("\n")
+    print("=" * 70)
+    print("VALIDATION COMPLETED")
+    print("=" * 70)
+
 
 if __name__ == "__main__":
     main()

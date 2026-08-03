@@ -1,117 +1,91 @@
-import os
-import sys
-import json
-
-# ------------------------------------------------------------------
-# Add project root
-# ------------------------------------------------------------------
-PROJECT_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..")
-)
-
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
-from database.mysql_connection import get_connection
-
-# ------------------------------------------------------------------
-# JSON File
-# ------------------------------------------------------------------
-JSON_FILE = "data/raw/power.json"
-
-# ------------------------------------------------------------------
-# SQL Query
-# ------------------------------------------------------------------
-INSERT_QUERY = """
-INSERT INTO power
-(timestamp, node, socket, cpu_power, memory_power, node_power)
-VALUES (%s, %s, %s, %s, %s, %s)
-ON DUPLICATE KEY UPDATE
-cpu_power=VALUES(cpu_power),
-memory_power=VALUES(memory_power),
-node_power=VALUES(node_power)
+"""
+Insert Power telemetry into MySQL.
 """
 
-# ------------------------------------------------------------------
-# Read concatenated JSON objects
-# ------------------------------------------------------------------
-def read_json_objects(file_path):
+from src.ingestion.file_scanner import find_json_files
+from src.ingestion.json_parser import iter_json_records
+from src.ingestion.db_writer import batch_insert
+from src.ingestion.config import RAW_DATA_DIR
 
-    with open(file_path, "r", encoding="utf-8") as f:
 
-        buffer = ""
-        braces = 0
+INSERT_QUERY = """
+INSERT IGNORE INTO power
+(
+    timestamp,
+    node,
+    socket,
+    cpu_power,
+    memory_power
+)
+VALUES (%s,%s,%s,%s,%s)
+"""
 
-        for line in f:
 
-            buffer += line
-
-            braces += line.count("{")
-            braces -= line.count("}")
-
-            if braces == 0 and buffer.strip():
-
-                yield json.loads(buffer)
-
-                buffer = ""
-
-# ------------------------------------------------------------------
-# Insert Power Data
-# ------------------------------------------------------------------
-def insert_power():
-
-    print("========== START ==========")
-
-    conn = get_connection()
-    cursor = conn.cursor()
+def extract_power_records(record):
 
     rows = []
 
-    for obj in read_json_objects(JSON_FILE):
+    timestamp = record["timestamp"]
 
-        timestamp = obj["timestamp"]
+    node = next(iter(record["data"]))
 
-        data = obj["data"]
+    node_data = record["data"][node]
 
-        for node, node_data in data.items():
+    for socket_name, socket_data in node_data.items():
 
-            node_power = float(node_data["power_node_watts"])
+        if not socket_name.startswith("socket_"):
+            continue
 
-            for socket in [0, 1]:
+        socket = int(socket_name.replace("socket_", ""))
 
-                socket_key = f"socket_{socket}"
+        cpu_power = float(
+            socket_data.get("power_cpu_watts", 0)
+        )
 
-                socket_data = node_data[socket_key]
+        memory_power = float(
+            socket_data.get("power_mem_watts", 0)
+        )
 
-                cpu_power = float(socket_data["power_cpu_watts"])
-                memory_power = float(socket_data["power_mem_watts"])
+        rows.append(
+            (
+                timestamp,
+                node,
+                socket,
+                cpu_power,
+                memory_power,
+            )
+        )
 
-                rows.append(
-                    (
-                        timestamp,
-                        node,
-                        socket,
-                        cpu_power,
-                        memory_power,
-                        node_power
-                    )
-                )
+    return rows
 
-    print(f"Prepared {len(rows)} rows")
+def main():
 
-    cursor.executemany(INSERT_QUERY, rows)
+    all_rows = []
 
-    conn.commit()
+    json_files = find_json_files(
+        RAW_DATA_DIR,
+        "power.json"
+    )
 
-    print(f"Inserted {cursor.rowcount} rows successfully.")
+    print(f"\nFound {len(json_files)} power files.\n")
 
-    cursor.close()
-    conn.close()
+    for file in json_files:
 
-    print("=========== END ===========")
+        print(f"Reading: {file}")
 
-# ------------------------------------------------------------------
-# Main
-# ------------------------------------------------------------------
+        for record in iter_json_records(file):
+
+            all_rows.extend(
+                extract_power_records(record)
+            )
+
+    print(f"\nTotal rows extracted: {len(all_rows)}")
+
+    batch_insert(
+        INSERT_QUERY,
+        all_rows
+    )
+
+
 if __name__ == "__main__":
-    insert_power()
+    main()

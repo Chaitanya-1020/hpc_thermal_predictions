@@ -1,126 +1,101 @@
-import os
-import sys
-import json
-
-# ------------------------------------------------------------------
-# Add project root to Python path
-# ------------------------------------------------------------------
-PROJECT_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..")
-)
-
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
-from database.mysql_connection import get_connection
-
-# ------------------------------------------------------------------
-# JSON File Path
-# ------------------------------------------------------------------
-JSON_FILE = "data/raw/frequency.json"
-
-# ------------------------------------------------------------------
-# SQL Query
-# ------------------------------------------------------------------
-INSERT_QUERY = """
-INSERT INTO frequency
-(timestamp, node, socket, core, frequency)
-VALUES (%s, %s, %s, %s, %s)
-ON DUPLICATE KEY UPDATE
-frequency = VALUES(frequency)
+"""
+Insert frequency telemetry into MySQL.
 """
 
-# ------------------------------------------------------------------
-# Read Concatenated JSON Objects
-# ------------------------------------------------------------------
-def read_json_objects(file_path):
-
-    with open(file_path, "r", encoding="utf-8") as file:
-
-        buffer = ""
-        brace_count = 0
-
-        for line in file:
-
-            buffer += line
-
-            brace_count += line.count("{")
-            brace_count -= line.count("}")
-
-            if brace_count == 0 and buffer.strip():
-
-                yield json.loads(buffer)
-
-                buffer = ""
+from src.ingestion.file_scanner import find_json_files
+from src.ingestion.json_parser import iter_json_records
+from src.ingestion.db_writer import batch_insert
+from src.ingestion.config import RAW_DATA_DIR
 
 
-# ------------------------------------------------------------------
-# Insert Frequency Data
-# ------------------------------------------------------------------
-def insert_frequency():
+INSERT_QUERY = """
+INSERT IGNORE INTO frequency
+(
+    timestamp,
+    node,
+    socket,
+    core,
+    frequency
+)
+VALUES (%s,%s,%s,%s,%s)
+"""
 
-    print("========== START ==========")
 
-    conn = get_connection()
-    cursor = conn.cursor()
-
+def extract_frequency_records(record):
     rows = []
 
-    for obj in read_json_objects(JSON_FILE):
+    timestamp = record["timestamp"]
 
-        timestamp = obj["timestamp"]
+    node = next(iter(record["data"]))
 
-        for node_name, node_data in obj["data"].items():
+    node_data = record["data"][node]
 
-            for socket_name, socket_data in node_data.items():
+    for socket_name, socket_data in node_data.items():
 
-                if not socket_name.startswith("socket_"):
-                    continue
+        # Skip metadata (timestamp etc.)
+        if not socket_name.startswith("socket_"):
+            continue
 
-                socket_number = int(socket_name.split("_")[1])
+        socket_id = int(socket_name.replace("socket_", ""))
 
-                cpu = socket_data.get("CPU", {})
+        cpu = socket_data.get("CPU", {})
 
-                core_data = cpu.get("core", {})
+        # frequency.json uses "core" (lowercase)
+        core_data = cpu.get("core", {})
 
-                for key, value in core_data.items():
+        for key, value in core_data.items():
 
-                    if not key.startswith("core_"):
-                        continue
+            if not key.startswith("core_"):
+                continue
 
-                    if not key.endswith("_avg_freq_mhz"):
-                        continue
+            if not key.endswith("_avg_freq_mhz"):
+                continue
 
-                    core_number = int(
-                        key.replace("core_", "").replace("_avg_freq_mhz", "")
-                    )
+            core_id = int(
+                key.replace("core_", "").replace("_avg_freq_mhz", "")
+            )
 
-                    rows.append(
-                        (
-                            timestamp,
-                            node_name,
-                            socket_number,
-                            core_number,
-                            float(value),
-                        )
-                    )
+            rows.append(
+                (
+                    timestamp,
+                    node,
+                    socket_id,
+                    core_id,
+                    float(value),
+                )
+            )
 
-    print(f"Prepared {len(rows)} rows")
-
-    cursor.executemany(INSERT_QUERY, rows)
-
-    conn.commit()
-
-    print(f"Inserted {cursor.rowcount} rows successfully.")
-
-    cursor.close()
-    conn.close()
-
-    print("=========== END ===========")
+    return rows
 
 
-# ------------------------------------------------------------------
-# Main
-# ------------------------------------------------------------------
+def main():
+
+    all_rows = []
+
+    json_files = find_json_files(
+        RAW_DATA_DIR,
+        "frequency.json"
+    )
+
+    print(f"\nFound {len(json_files)} frequency files.\n")
+
+    for file in json_files:
+
+        print(f"Reading: {file}")
+
+        for record in iter_json_records(file):
+
+            all_rows.extend(
+                extract_frequency_records(record)
+            )
+
+    print(f"\nTotal rows extracted: {len(all_rows)}")
+
+    batch_insert(
+        INSERT_QUERY,
+        all_rows
+    )
+
+
 if __name__ == "__main__":
-    insert_frequency()
+    main()
